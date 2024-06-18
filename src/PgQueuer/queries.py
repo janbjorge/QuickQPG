@@ -247,7 +247,7 @@ class QueryBuilder:
         SET status = 'picked', updated = NOW()
         WHERE
                 id = ANY(SELECT id FROM combined_jobs)
-            AND (SELECT rps from RPS) <= 100
+            -- AND (SELECT rps from RPS) <= 100
         RETURNING *
     )
     SELECT * FROM updated ORDER BY priority DESC, id ASC
@@ -405,6 +405,43 @@ class QueryBuilder:
                 AND column_name = $2
             );"""
 
+    def create_rps_query(self) -> str:
+        return f"""
+    WITH picked AS (
+        SELECT
+            DATE_TRUNC('sec', updated at time zone 'UTC') AS created,
+            entrypoint,
+            'picked' as slab,
+            status::text,
+            count(*) as count
+        FROM
+            {self.settings.queue_table}
+        WHERE
+            status = 'picked'
+        GROUP BY
+            DATE_TRUNC('sec', updated at time zone 'UTC'),
+            entrypoint,
+            slab,
+            status
+    ), done AS (
+        SELECT
+            DATE_TRUNC('sec', created at time zone 'UTC') AS created,
+            entrypoint,
+            'done' as slab,
+            status::text,
+            count
+        FROM
+            {self.settings.statistics_table}
+    ), combined AS (
+        SELECT * FROM picked
+        UNION ALL
+        SELECT * FROM done
+    )
+    SELECT * FROM combined
+    WHERE NOW() - created < interval '60 seconds'
+    ORDER BY created;
+"""
+
 
 @dataclasses.dataclass
 class Queries:
@@ -558,3 +595,9 @@ class Queries:
             self.qb.settings.queue_table,
             "updated",
         )
+
+    async def rps(self) -> list[models.RPSStatistics]:
+        return [
+            models.RPSStatistics.model_validate(dict(row))
+            for row in await self.driver.fetch(self.qb.create_rps_query())
+        ]

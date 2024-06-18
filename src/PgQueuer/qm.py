@@ -22,7 +22,7 @@ from .buffers import JobBuffer
 from .db import Driver
 from .listeners import initialize_event_listener
 from .logconfig import logger
-from .models import Job, PGChannel
+from .models import STATUS_LOG, Job, PGChannel, RPSStatistics
 from .queries import DBSettings, Queries
 from .tm import TaskManager
 
@@ -89,10 +89,24 @@ class QueueManager:
         instance creation.
         """
         self.queries = Queries(self.connection)
+
+        async def log_jobs(
+            job_status: list[tuple[Job, STATUS_LOG]],
+        ) -> None:
+            while True:
+                try:
+                    await self.queries.log_jobs(job_status)
+                except Exception as e:
+                    print(e, str(e))
+                    await asyncio.sleep(0.001)
+                else:
+                    return
+
         self.buffer = JobBuffer(
             max_size=10,
             timeout=timedelta(seconds=0.01),
-            flush_callback=self.queries.log_jobs,
+            flush_callback=log_jobs,
+            # flush_callback=self.queries.log_jobs,
         )
 
     def entrypoint(self, name: str) -> Callable[[T], T]:
@@ -137,8 +151,51 @@ class QueueManager:
 
         self.buffer.max_size = batch_size
 
+        async def rps() -> None:
+            import math
+            from datetime import datetime, timezone
+            from statistics import mean, median
+
+            def weighted_jobs_per_second(
+                stats: list[RPSStatistics], half_life: float = 10.0
+            ) -> float:
+                """
+                Estimate the jobs per second using exponentially weighted averaging.
+
+                Parameters:
+                stats (List[RPSStatistics]): List of RPSStatistics objects.
+                half_life (float): The half-life for the exponential decay in seconds.
+
+                Returns:
+                float: Estimated jobs per second.
+                """
+                if not stats:
+                    return 0.0
+
+                now = datetime.now(timezone.utc).timestamp()
+                decay_constant = math.log(2) / half_life
+
+                weighted_sum = 0.0
+                weight_sum = 0.0
+
+                for stat in stats:
+                    age_seconds = now - stat.created.timestamp()
+                    weight = math.exp(-decay_constant * age_seconds)
+                    weight = 1 / len(stats)
+                    weighted_sum += stat.count * weight
+                    weight_sum += weight
+
+                return weighted_sum / weight_sum if weight_sum != 0 else 0.0
+
+            while self.alive:
+                rows = await self.queries.rps()
+                print("rps", weighted_jobs_per_second(rows))
+
+                await asyncio.sleep(1)
+
         async with TaskManager() as tm:
             tm.add(asyncio.create_task(self.buffer.monitor()))
+            tm.add(asyncio.create_task(rps()))
             listener = await initialize_event_listener(self.connection, self.channel)
 
             while self.alive:
